@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RSR+ Outbound Trickle v2
 // @namespace    https://github.com/youngryan521
-// @version      2.13.0
+// @version      2.14.0
 // @description  Incremental SP00 relay -- Rodeo ManifestPending -> Sort Center Trickle, priority by CPT
 // @author       youryanh
 // @match        https://rodeo-iad.amazon.com/*
@@ -37,6 +37,7 @@
              skipList:         [],  // permanent: step-1 rejections (SP00 unrecognized)
              cooldowns:        {},  // rawId -> ms when cooldown expires (all destIds closed)
              recentlyProcessed: [], // last 20 rawIds processed -- prevents same-item oscillation
+             errorCount:       {},  // rawId -> consecutive error count for 3-strike permanent skip
              ok14: 0, err14: 0, ok22: 0, err22: 0, ok02: 0, err02: 0 };
   }
   function load()  { try { return JSON.parse(GM_getValue(KEY, 'null')) || blank(); } catch { return blank(); } }
@@ -147,8 +148,16 @@
         } else if (s.action === 'error') {
           s[errKey[s.cpt]]++;
           if (s.rawId) {
-            s.cooldowns[s.rawId] = Date.now() + COOLDOWN_MS;
-            console.log('[RSR+][Rodeo] 5min cooldown for', s.rawId);
+            s.errorCount = s.errorCount || {};
+            s.errorCount[s.rawId] = (s.errorCount[s.rawId] || 0) + 1;
+            if (s.errorCount[s.rawId] >= 3 && !s.skipList.includes(s.rawId)) {
+              // 3-strike: item consistently rejected by Trickle (already in container / wrong route)
+              s.skipList.push(s.rawId);
+              console.log('[RSR+][Rodeo] Permanent skip after 3 errors:', s.rawId);
+            } else {
+              s.cooldowns[s.rawId] = Date.now() + COOLDOWN_MS;
+              console.log('[RSR+][Rodeo] Cooldown for', s.rawId, '(error #' + s.errorCount[s.rawId] + ')');
+            }
           }
           s.recentlyProcessed = [s.rawId, ...s.recentlyProcessed].slice(0, 20);
           s.action = 'idle'; save(s);
@@ -208,6 +217,26 @@
     });
     document.body.appendChild(bar);
 
+    // ── Status bar (persistent bottom strip) ─────────────────────────────────
+    const statusBar = document.createElement('div');
+    Object.assign(statusBar.style, {
+      position:'fixed', bottom:'0', left:'0', right:'0', padding:'3px 10px',
+      fontSize:'12px', fontFamily:'Courier New,monospace', zIndex:'99998',
+      background:'#0d1117', color:'#58a6ff', textAlign:'center',
+      borderTop:'1px solid #30363d',
+    });
+    statusBar.textContent = 'RSR+ | loading...';
+    document.body.appendChild(statusBar);
+
+    function updateStatus(state) {
+      const s = load();
+      const ok   = (s.ok14||0) + (s.ok22||0) + (s.ok02||0);
+      const err  = (s.err14||0) + (s.err22||0) + (s.err02||0);
+      const skip = (s.skipList||[]).length;
+      statusBar.textContent =
+        `RSR+ | Moved: ${ok} | Errors: ${err} | Skipped: ${skip}${state ? ' | ' + state : ''}`;
+    }
+
     function flash(msg, bg, ms = 1200) {
       bar.textContent = msg; bar.style.background = bg;
       bar.style.color = '#fff'; bar.style.display = 'block';
@@ -256,7 +285,7 @@
     // "Scan container to move", which looks like success. New approach: attach a
     // dedicated MutationObserver to #infodisplay BEFORE the scan so it records
     // ALL text that appears (even if it clears in <50ms). Then decide on that history.
-    async function tryScanDestId(destId) {
+    async function tryScanDestId(destId, sp00) {
       console.log('[RSR+] Trying destId:', destId);
       flash(`DEST: ${destId.slice(0,22)}...`, '#1a237e', 900);
 
@@ -290,6 +319,14 @@
       const allSeen = [...seen].join(' ');
       console.log('[RSR+] infodisplay history:', allSeen || '(empty)');
 
+      // FIX v2.14.0: use SP00 presence in infodisplay as the POSITIVE success signal.
+      // On success, Trickle appends "Moved container `SP...` To `CART...`" to infodisplay.
+      // On stray-path BEEP, infodisplay is unchanged (shows previous item's text, not current sp00).
+      // allSeen.includes(sp00) is reliable -- the full SP00 ID won't appear in a previous item's text.
+      if (sp00 && allSeen.includes(sp00)) {
+        console.log('[RSR+] Move confirmed (infodisplay contains sp00):', sp00);
+        return 'success';
+      }
       if (/already scanned|move_to_sameparent/i.test(allSeen)) {
         console.log('[RSR+] Already in container -- success');
         return 'success';
@@ -300,22 +337,22 @@
         return 'reject';
       }
 
-      // No error seen in any recorded text
+      // Page left dest step but SP00 not confirmed = stray BEEP rejection (silent fail)
       if (!atDestStep()) {
-        console.log('[RSR+] destId accepted (no error captured):', destId);
-        return 'success';
+        console.log('[RSR+] BEEP -- SP00 not confirmed in infodisplay. Treating as reject.');
+        return 'reject';
       }
 
       console.log('[RSR+] destId timed out at dest step:', destId);
       return 'reject';
     }
 
-    async function tryAllDestIds(primaryDestId) {
+    async function tryAllDestIds(primaryDestId, sp00) {
       const others  = CPTS.filter(c => c.destId !== primaryDestId).map(c => c.destId);
       const destIds = [primaryDestId, ...others];
       for (const destId of destIds) {
         await sleep(200);
-        const result = await tryScanDestId(destId);
+        const result = await tryScanDestId(destId, sp00);
 
         if (result === 'success') return destId;
 
@@ -323,7 +360,7 @@
           flash('CONTAINER NOT OPEN -- retrying in 45s', '#e65100', 45000);
           console.log('[RSR+] Container not open. Waiting 45s...');
           await sleep(45000);
-          const r2 = await tryScanDestId(destId);
+          const r2 = await tryScanDestId(destId, sp00);
           if (r2 === 'success') return destId;
           console.log('[RSR+] Still closed after retry. Next destId.');
         }
@@ -376,7 +413,7 @@
       }
 
       // Step 2: scan destIds
-      const worked = await tryAllDestIds(s.destId);
+      const worked = await tryAllDestIds(s.destId, s.sp00);
       if (!worked) console.log('[RSR+] All destIds failed.');
       return worked !== null;
     }
@@ -388,7 +425,7 @@
       while (true) {
         await sleep(TRICKLE_MS);
         const s = load();
-        if (s.action !== 'pending') continue;
+        if (s.action !== 'pending') { updateStatus('waiting'); continue; }
 
         const result = await submit(s);
 
@@ -402,11 +439,11 @@
         } else if (result === true) {
           s2.action = 'done';
           save(s2);
-          flash(`SUCCESS  ${s.sp00}`, '#1b5e20', 1500);
+          updateStatus(); flash(`SUCCESS  ${s.sp00}`, '#1b5e20', 1500);
         } else {
           s2.action = 'error';
           save(s2);
-          flash(`ALL DESTS FAILED  ${s.sp00}`, '#7f0000', 3000);
+          updateStatus(); flash(`ALL DESTS FAILED  ${s.sp00}`, '#7f0000', 3000);
         }
       }
     }
