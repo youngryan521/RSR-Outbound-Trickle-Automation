@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RSR+ Outbound Trickle v2
 // @namespace    https://github.com/youngryan521
-// @version      2.14.0
+// @version      2.15.0
 // @description  Incremental SP00 relay -- Rodeo ManifestPending -> Sort Center Trickle, priority by CPT
 // @author       youryanh
 // @match        https://rodeo-iad.amazon.com/*
@@ -217,26 +217,6 @@
     });
     document.body.appendChild(bar);
 
-    // ── Status bar (persistent bottom strip) ─────────────────────────────────
-    const statusBar = document.createElement('div');
-    Object.assign(statusBar.style, {
-      position:'fixed', bottom:'0', left:'0', right:'0', padding:'3px 10px',
-      fontSize:'12px', fontFamily:'Courier New,monospace', zIndex:'99998',
-      background:'#0d1117', color:'#58a6ff', textAlign:'center',
-      borderTop:'1px solid #30363d',
-    });
-    statusBar.textContent = 'RSR+ | loading...';
-    document.body.appendChild(statusBar);
-
-    function updateStatus(state) {
-      const s = load();
-      const ok   = (s.ok14||0) + (s.ok22||0) + (s.ok02||0);
-      const err  = (s.err14||0) + (s.err22||0) + (s.err02||0);
-      const skip = (s.skipList||[]).length;
-      statusBar.textContent =
-        `RSR+ | Moved: ${ok} | Errors: ${err} | Skipped: ${skip}${state ? ' | ' + state : ''}`;
-    }
-
     function flash(msg, bg, ms = 1200) {
       bar.textContent = msg; bar.style.background = bg;
       bar.style.color = '#fff'; bar.style.display = 'block';
@@ -347,25 +327,23 @@
       return 'reject';
     }
 
+    // Only try the primary destId. No fallback to other CPT containers.
+    // After any BEEP, Trickle resets to start state -- scanning a destId at start state
+    // would make Trickle treat the UUID as a "container to move" (not a destination).
     async function tryAllDestIds(primaryDestId, sp00) {
-      const others  = CPTS.filter(c => c.destId !== primaryDestId).map(c => c.destId);
-      const destIds = [primaryDestId, ...others];
-      for (const destId of destIds) {
-        await sleep(200);
-        const result = await tryScanDestId(destId, sp00);
+      await sleep(200);
+      const result = await tryScanDestId(primaryDestId, sp00);
 
-        if (result === 'success') return destId;
+      if (result === 'success') return primaryDestId;
 
-        if (result === 'closed') {
-          flash('CONTAINER NOT OPEN -- retrying in 45s', '#e65100', 45000);
-          console.log('[RSR+] Container not open. Waiting 45s...');
-          await sleep(45000);
-          const r2 = await tryScanDestId(destId, sp00);
-          if (r2 === 'success') return destId;
-          console.log('[RSR+] Still closed after retry. Next destId.');
-        }
-        // 'reject' or still-closed: try next destId
+      if (result === 'closed') {
+        flash('CONTAINER NOT OPEN -- waiting 45s', '#e65100', 45000);
+        console.log('[RSR+] Container not open. Waiting 45s...');
+        await sleep(45000);
+        // Don't retry here -- page is now at start state and would need a full SP00 re-scan.
+        // Fail this attempt; Rodeo will put item on 5-min cooldown and retry the full flow.
       }
+
       return null;
     }
 
@@ -425,7 +403,7 @@
       while (true) {
         await sleep(TRICKLE_MS);
         const s = load();
-        if (s.action !== 'pending') { updateStatus('waiting'); continue; }
+        if (s.action !== 'pending') continue;
 
         const result = await submit(s);
 
@@ -439,11 +417,11 @@
         } else if (result === true) {
           s2.action = 'done';
           save(s2);
-          updateStatus(); flash(`SUCCESS  ${s.sp00}`, '#1b5e20', 1500);
+          flash(`SUCCESS  ${s.sp00}`, '#1b5e20', 1500);
         } else {
           s2.action = 'error';
           save(s2);
-          updateStatus(); flash(`ALL DESTS FAILED  ${s.sp00}`, '#7f0000', 3000);
+          flash(`ALL DESTS FAILED  ${s.sp00}`, '#7f0000', 3000);
         }
       }
     }
