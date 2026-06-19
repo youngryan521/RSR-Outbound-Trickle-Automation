@@ -10,8 +10,8 @@
 // @grant        GM_getValue
 // @grant        unsafeWindow
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/youngryan521/Projects/main/rsr-dropzone-v2.user.js
-// @downloadURL  https://raw.githubusercontent.com/youngryan521/Projects/main/rsr-dropzone-v2.user.js
+// @updateURL    https://raw.githubusercontent.com/youngryan521/RSR-Outbound-Trickle-Automation/RSR-DROPZONE-AUTOMATION/rsr-dropzone-v2.user.js
+// @downloadURL  https://raw.githubusercontent.com/youngryan521/RSR-Outbound-Trickle-Automation/RSR-DROPZONE-AUTOMATION/rsr-dropzone-v2.user.js
 // ==/UserScript==
 
 (function () {
