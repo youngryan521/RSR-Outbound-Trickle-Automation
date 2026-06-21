@@ -1,6 +1,6 @@
 # RSR+ Outbound Dropzone v2
 
-**Author:** youryanh | **Version:** 1.1.0 | **Updated:** 2026-06-20
+**Author:** youryanh | **Version:** 1.1.1 | **Updated:** 2026-06-20
 
 A Tampermonkey userscript that automates the **Sort Center Rodeo → Move (Dropzone)**
 workflow at Amazon FCs. Reads the ManifestPending queue from Rodeo, converts each SP00
@@ -218,6 +218,29 @@ at a time in Tampermonkey.
 ---
 
 ## Version History
+
+### v1.1.1 — 2026-06-21
+**Fix: background tab support — runs while you work in other tabs**
+
+Parity with RSR+ Trickle v2.18.2. Previously the script required the Move tab to stay
+focused. Switching to another tab caused keyboard scan injection to fail silently, and
+background timer throttling caused lag on return.
+
+**`waitVisible()`** — resolves immediately if visible; waits for tab focus if hidden.
+
+**`sleepOrVisible(ms)`** — replaces `sleep(MOVE_MS)` in the processing loop. Wakes
+immediately when the tab becomes visible instead of waiting out the throttled timer.
+
+**`scanInject` → async**:
+- `sd.receivedScanEvent` (primary): works in background tabs unchanged.
+- Keyboard fallback: checks `document.hidden` before dispatching events. If hidden,
+  calls `waitVisible()` and holds until the tab regains focus before firing.
+
+**Practical result:** Leave the Move tab in the background while doing PackApp, ShipApp,
+or other work. Rodeo polling and scan injection continue running. Return to the tab
+at any time — processing resumes immediately.
+
+---
 
 ### v1.1.0 — 2026-06-20
 **Parity with RSR+ Trickle v2.18.1: modernize + spR tantei lookup**
