@@ -1,27 +1,29 @@
 // ==UserScript==
 // @name         RSR+ Outbound Trickle v2
 // @namespace    https://github.com/youngryan521
-// @version      2.15.0
+// @version      2.18.0
 // @description  Incremental SP00 relay -- Rodeo ManifestPending -> Sort Center Trickle, priority by CPT
 // @author       youryanh
 // @match        https://rodeo-iad.amazon.com/*
 // @match        https://sortcenter-menu-na.amazon.com/containerization/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      trans-logistics.amazon.com
 // @run-at       document-idle
-// @updateURL    https://raw.githubusercontent.com/youngryan521/Projects/main/rsr-trickle-v2.user.js
-// @downloadURL  https://raw.githubusercontent.com/youngryan521/Projects/main/rsr-trickle-v2.user.js
+// @updateURL    https://raw.githubusercontent.com/youngryan521/RSR-Outbound-Trickle-Automation/main/rsr-trickle-v2.user.js
+// @downloadURL  https://raw.githubusercontent.com/youngryan521/RSR-Outbound-Trickle-Automation/main/rsr-trickle-v2.user.js
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const KEY        = 'rsr_v2';
-  const RODEO_MS   = 2000;
-  const TRICKLE_MS = 600;
-  const FC_UTC_OFFSET_H = -5; // QIW9 = CDT (UTC-5)
-  const COOLDOWN_MS = 5 * 60000; // 5 min before retrying a container-closed item
+  const KEY         = 'rsr_v2';
+  const RODEO_MS    = 2000;
+  const TRICKLE_MS  = 600;
+  const FC_UTC_OFFSET_H = -5;   // QIW9 = CDT (UTC-5)
+  const COOLDOWN_MS = 5 * 60000;
 
   const CPTS = [
     { label: '14:30', h: 14, m: 30, destId: '1ccd5e27-2a40-59cf-37e1-3b880c243e57' },
@@ -29,22 +31,25 @@
     { label: '02:00', h:  2, m:  0, destId: 'aacd5e27-2a4c-7d53-fc04-093007fe0f5c' },
   ];
 
-  // ── STATE ────────────────────────────────────────────────────────────────────
+  // -- STATE ------------------------------------------------------------------
 
   function blank() {
-    return { sp00: null, rawId: null, destId: null, cpt: null, action: 'idle',
-             pausedAt: null,
-             skipList:         [],  // permanent: step-1 rejections (SP00 unrecognized)
-             cooldowns:        {},  // rawId -> ms when cooldown expires (all destIds closed)
-             recentlyProcessed: [], // last 20 rawIds processed -- prevents same-item oscillation
-             errorCount:       {},  // rawId -> consecutive error count for 3-strike permanent skip
-             ok14: 0, err14: 0, ok22: 0, err22: 0, ok02: 0, err02: 0 };
+    return {
+      sp00: null, rawId: null, destId: null, cpt: null, action: 'idle',
+      pausedAt: null,
+      skipList:          [],
+      cooldowns:         {},
+      recentlyProcessed: [],
+      errorCount:        {},
+      ok14: 0, err14: 0, ok22: 0, err22: 0, ok02: 0, err02: 0,
+    };
   }
   function load()  { try { return JSON.parse(GM_getValue(KEY, 'null')) || blank(); } catch { return blank(); } }
   function save(s) { GM_setValue(KEY, JSON.stringify(s)); }
 
-  // ── SP00 / CPT UTILS ─────────────────────────────────────────────────────────
+  // -- SP00 / CPT UTILS -------------------------------------------------------
 
+  // spP only -- direct character conversion (confirmed working)
   function toTrickle(id) { return 'SP' + id.slice(3) + '_001_v'; }
 
   function dwellMins(text) {
@@ -57,14 +62,12 @@
   }
 
   function cptMs(cpt) {
-    const now = new Date();
+    const now    = new Date();
     const utcMid = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
-    let utcH = cpt.h - FC_UTC_OFFSET_H, dayOffset = 0;
-    if (utcH >= 24) { utcH -= 24; dayOffset = 1; }
-    const ms = utcMid + dayOffset * 86400000 + utcH * 3600000 + cpt.m * 60000;
-    const nowCDT_h = ((now.getUTCHours() + FC_UTC_OFFSET_H) + 24) % 24;
-    if (cpt.h < 6 && nowCDT_h >= 12) return ms + 86400000;
-    return ms;
+    let utcH = cpt.h - FC_UTC_OFFSET_H, dayOff = 0;
+    if (utcH >= 24) { utcH -= 24; dayOff = 1; }
+    const ms = utcMid + dayOff * 86400000 + utcH * 3600000 + cpt.m * 60000;
+    return ms <= now.getTime() ? ms + 86400000 : ms;
   }
 
   function cptUrl(cpt) {
@@ -75,353 +78,409 @@
            `&ExSDRange.RangeStartMillis=${ms-1}&shipmentType=CUSTOMER_SHIPMENTS`;
   }
 
-  async function fetchItems(cpt, skipList, cooldowns) {
-    try {
-      const res = await fetch(cptUrl(cpt), { credentials: 'include' });
-      if (!res.ok) return [];
-      const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-      const out = [];
-      doc.querySelectorAll('tr, [role="row"]').forEach(row => {
-        const txt = row.textContent;
-        const sp  = txt.match(/\bsp[A-Z][A-Za-z0-9]{6,18}\b/);
-        if (sp) out.push({ id: sp[0], dwell: dwellMins(txt) });
+  // -- TANTEI LOOKUP (spR orders) -----------------------------------------------
+  // spR (PPMultiBldgWide) SP00s have no deterministic conversion formula.
+  // The Trickle ID is obtained by:
+  //   1. Extracting ShipmentId from the Rodeo data-url attribute (referenceId param)
+  //   2. Querying the tantei GraphQL API with SHIPMENT_ID
+  //   3. Finding the containerLabel matching /^SP[A-Za-z0-9]{7}T_001_v$/ in the response
+
+  const sp00ToShipmentId = {};   // populated each fetchItems() call from data-url attrs
+  let   tanteiToken      = null; // CSRF token (anti-csrftoken-a2z), cached per session
+  const trickleIdCache   = {};   // shipmentId -> trickleId, permanent per session
+
+  // Promise wrapper around GM_xmlhttpRequest (bypasses CORS for cross-origin calls)
+  function gmFetch(method, url, headers, body) {
+    headers = headers || {};
+    body    = body    || null;
+    return new Promise(function(resolve, reject) {
+      GM_xmlhttpRequest({
+        method:          method,
+        url:             url,
+        headers:         headers,
+        data:            body,
+        withCredentials: true,
+        onload:          function(r) { resolve(r.responseText); },
+        onerror:         function()  { reject(new Error('gmFetch failed: ' + url)); },
+        ontimeout:       function()  { reject(new Error('gmFetch timeout: ' + url)); },
       });
-      return out
-        .filter(x => {
-          if ((skipList  || []).includes(x.id))              return false;
-          if (Date.now() < ((cooldowns || {})[x.id] || 0))  return false;
-          return true;
-        })
-        .sort((a, b) => b.dwell - a.dwell);
-    } catch { return []; }
-  }
-
-  // ── SHARED UTILS ─────────────────────────────────────────────────────────────
-
-  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-  function waitFor(pred, ms = 5000) {
-    return new Promise(resolve => {
-      if (pred()) return resolve(true);
-      const ob = new MutationObserver(() => { if (pred()) { ob.disconnect(); clearTimeout(t); resolve(true); } });
-      ob.observe(document.body, { childList: true, subtree: true, characterData: true });
-      const t = setTimeout(() => { ob.disconnect(); resolve(false); }, ms);
     });
   }
 
-  // ── ENTRY ────────────────────────────────────────────────────────────────────
+  // Recursively search parsed JSON for a Trickle-format barcode string
+  function findTrickleId(obj) {
+    if (!obj || typeof obj !== 'object') return null;
+    var vals = Object.values(obj);
+    for (var i = 0; i < vals.length; i++) {
+      var v = vals[i];
+      if (typeof v === 'string' && /^SP[A-Za-z0-9]{7}T_001_v$/.test(v)) return v;
+      if (typeof v === 'object') { var f = findTrickleId(v); if (f) return f; }
+    }
+    return null;
+  }
+
+  async function lookupTrickleIdFromTantei(shipmentId) {
+    if (trickleIdCache[shipmentId]) return trickleIdCache[shipmentId];
+    try {
+      // Step 1: get CSRF token from tantei HTML page (cached for the session)
+      if (!tanteiToken) {
+        console.log('[RSR+][Tantei] Fetching CSRF token...');
+        var html = await gmFetch('GET', 'https://trans-logistics.amazon.com/sortcenter/tantei?nodeId=QIW9');
+        var m = html.match(/name=['"]__token_['"]\s+value=['"]([^'"]+)['"]/);
+        if (m) {
+          tanteiToken = m[1];
+          console.log('[RSR+][Tantei] Token acquired');
+        } else {
+          console.log('[RSR+][Tantei] __token_ not found in page');
+          return null;
+        }
+      }
+
+      // Step 2: GraphQL query -- searchEntities with SHIPMENT_ID
+      var query = '\n        query ($queryInput: [SearchTermInput!]!, $startIndex: String) {\n          searchEntities(searchTerms: $queryInput) {\n            searchTerm { nodeId searchId searchIdType resolvedIdType }\n            contents(pageSize: 60, startIndex: $startIndex, forwardNavigate: true) {\n              contents {\n                containerId\n                containerLabel\n                containerType\n              }\n              endToken\n            }\n          }\n        }\n      ';
+
+      var variables = {
+        queryInput: [{
+          nodeId:       'QIW9',
+          nodeTimezone: 'America/Chicago',
+          searchId:     shipmentId,
+          searchIdType: 'SHIPMENT_ID',
+        }],
+      };
+
+      var responseText = await gmFetch(
+        'POST',
+        'https://trans-logistics.amazon.com/sortcenter/tantei/graphql',
+        { 'Content-Type': 'application/json', 'anti-csrftoken-a2z': tanteiToken },
+        JSON.stringify({ query: query, variables: variables })
+      );
+
+      var data      = JSON.parse(responseText);
+      var trickleId = findTrickleId(data);
+
+      if (trickleId) {
+        trickleIdCache[shipmentId] = trickleId;
+        console.log('[RSR+][Tantei] Resolved:', shipmentId, '->', trickleId);
+        return trickleId;
+      }
+
+      console.log('[RSR+][Tantei] No Trickle ID found for shipment', shipmentId);
+      console.log('[RSR+][Tantei] Response preview:', responseText.slice(0, 500));
+      return null;
+
+    } catch (e) {
+      console.log('[RSR+][Tantei] Error:', e.message);
+      tanteiToken = null; // reset so it re-fetches next time
+      return null;
+    }
+  }
+
+  // -- RODEO PAGE FETCH -------------------------------------------------------
+
+  async function fetchItems(cpt, skipList, cooldowns) {
+    try {
+      var url = cptUrl(cpt);
+      console.log('[RSR+][Rodeo] Fetching CPT', cpt.label, ':', url);
+      var res = await fetch(url, { credentials: 'include' });
+      if (!res.ok) {
+        console.log('[RSR+][Rodeo] fetchItems HTTP', res.status, 'for CPT', cpt.label);
+        return [];
+      }
+      var html = await res.text();
+      console.log('[RSR+][Rodeo] Response preview CPT', cpt.label, ':', html.slice(0, 400).replace(/\s+/g, ' '));
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+
+      // Build sp00 -> ShipmentId map from data-url attributes.
+      // Each .shipmentitem-highlight-link has:
+      //   data-url="/QIW9/ShipmentItem/mark?...&referenceId=458...&...&scannableId=spR...&..."
+      doc.querySelectorAll('[data-url]').forEach(function(el) {
+        var u   = el.getAttribute('data-url') || '';
+        var sp  = u.match(/[?&]scannableId=([^&]+)/);
+        var ref = u.match(/[?&]referenceId=(\d{10,})/);
+        if (sp && ref) sp00ToShipmentId[sp[1]] = ref[1];
+      });
+
+      var out = [];
+      doc.querySelectorAll('tr, [role="row"]').forEach(function(row) {
+        var txt = row.textContent;
+        var sp  = txt.match(/\bsp[A-Z][A-Za-z0-9]{6,18}\b/);
+        if (sp) out.push({ id: sp[0], dwell: dwellMins(txt) });
+      });
+
+      var skipped = out.filter(function(x) {
+        return (skipList || []).includes(x.id) || Date.now() < ((cooldowns || {})[x.id] || 0);
+      }).length;
+      var filtered = out.filter(function(x) {
+        if ((skipList  || []).includes(x.id))             return false;
+        if (Date.now() < ((cooldowns || {})[x.id] || 0)) return false;
+        return true;
+      }).sort(function(a, b) { return b.dwell - a.dwell; });
+
+      console.log('[RSR+][Rodeo] CPT', cpt.label, '-- rows:', out.length, '| skipped:', skipped, '| available:', filtered.length);
+      return filtered;
+    } catch (e) {
+      console.log('[RSR+][Rodeo] fetchItems error for CPT', cpt.label, ':', e.message);
+      return [];
+    }
+  }
+
+  // -- SHARED UTILS -----------------------------------------------------------
+
+  function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+
+  function waitFor(pred, ms) {
+    ms = ms || 5000;
+    return new Promise(function(resolve) {
+      if (pred()) return resolve(true);
+      var ob = new MutationObserver(function() {
+        if (pred()) { ob.disconnect(); clearTimeout(t); resolve(true); }
+      });
+      ob.observe(document.body, { childList: true, subtree: true, characterData: true });
+      var t = setTimeout(function() { ob.disconnect(); resolve(false); }, ms);
+    });
+  }
+
+  // -- ENTRY ------------------------------------------------------------------
 
   if      (location.href.includes('rodeo-iad.amazon.com'))                           runRodeo();
   else if (location.href.includes('sortcenter-menu-na.amazon.com/containerization')) runTrickle();
 
-  // ============================================================================
+  // ==========================================================================
   //  RODEO
-  // ============================================================================
+  // ==========================================================================
   function runRodeo() {
-    const okKey  = { '14:30':'ok14', '22:00':'ok22', '02:00':'ok02'  };
-    const errKey = { '14:30':'err14','22:00':'err22','02:00':'err02' };
+    var okKey  = { '14:30':'ok14', '22:00':'ok22', '02:00':'ok02'  };
+    var errKey = { '14:30':'err14','22:00':'err22','02:00':'err02' };
 
     async function loop() {
+      var s0 = load();
+      console.log('[RSR+][Rodeo] Loop started | skipList:', s0.skipList.length, '| action:', s0.action);
       while (true) {
-        await sleep(RODEO_MS);
-        let s = load();
-        s.skipList          = s.skipList          || [];
-        s.cooldowns         = s.cooldowns         || {};
-        s.recentlyProcessed = s.recentlyProcessed || [];
+        try {
+          await sleep(RODEO_MS);
+          var s = load();
+          s.skipList          = s.skipList          || [];
+          s.cooldowns         = s.cooldowns         || {};
+          s.recentlyProcessed = s.recentlyProcessed || [];
+          s.errorCount        = s.errorCount        || {};
 
-        // ── Handle completed action from Trickle ──────────────────────────────
-        if (s.action === 'done') {
-          s[okKey[s.cpt]]++;
-          // Add to recentlyProcessed so we don't immediately re-pick this item
-          s.recentlyProcessed = [s.rawId, ...s.recentlyProcessed].slice(0, 20);
-          s.action = 'idle'; save(s);
+          // Handle outcome from Trickle side
+          if (s.action === 'done') {
+            s[okKey[s.cpt]]++;
+            s.recentlyProcessed = [s.rawId].concat(s.recentlyProcessed).slice(0, 20);
+            s.errorCount[s.rawId] = 0;
+            s.action = 'idle'; save(s);
 
-        } else if (s.action === 'step1_fail') {
-          s[errKey[s.cpt]]++;
-          if (s.rawId && !s.skipList.includes(s.rawId)) {
-            s.skipList.push(s.rawId);
-            console.log('[RSR+][Rodeo] Permanent skip:', s.rawId);
-          }
-          s.recentlyProcessed = [s.rawId, ...s.recentlyProcessed].slice(0, 20);
-          s.action = 'idle'; save(s);
-
-        } else if (s.action === 'error') {
-          s[errKey[s.cpt]]++;
-          if (s.rawId) {
-            s.errorCount = s.errorCount || {};
-            s.errorCount[s.rawId] = (s.errorCount[s.rawId] || 0) + 1;
-            if (s.errorCount[s.rawId] >= 3 && !s.skipList.includes(s.rawId)) {
-              // 3-strike: item consistently rejected by Trickle (already in container / wrong route)
+          } else if (s.action === 'step1_fail') {
+            s[errKey[s.cpt]]++;
+            if (s.rawId && !s.skipList.includes(s.rawId)) {
               s.skipList.push(s.rawId);
-              console.log('[RSR+][Rodeo] Permanent skip after 3 errors:', s.rawId);
-            } else {
-              s.cooldowns[s.rawId] = Date.now() + COOLDOWN_MS;
-              console.log('[RSR+][Rodeo] Cooldown for', s.rawId, '(error #' + s.errorCount[s.rawId] + ')');
+              console.log('[RSR+][Rodeo] Permanent skip (step1):', s.rawId);
             }
+            s.recentlyProcessed = [s.rawId].concat(s.recentlyProcessed).slice(0, 20);
+            s.action = 'idle'; save(s);
+
+          } else if (s.action === 'error') {
+            s[errKey[s.cpt]]++;
+            if (s.rawId) {
+              s.errorCount[s.rawId] = (s.errorCount[s.rawId] || 0) + 1;
+              if (s.errorCount[s.rawId] >= 3 && !s.skipList.includes(s.rawId)) {
+                s.skipList.push(s.rawId);
+                console.log('[RSR+][Rodeo] Permanent skip after 3 errors:', s.rawId);
+              } else {
+                s.cooldowns[s.rawId] = Date.now() + COOLDOWN_MS;
+                console.log('[RSR+][Rodeo] Cooldown for', s.rawId, '(error #' + s.errorCount[s.rawId] + ')');
+              }
+            }
+            s.recentlyProcessed = [s.rawId].concat(s.recentlyProcessed).slice(0, 20);
+            s.action = 'idle'; save(s);
           }
-          s.recentlyProcessed = [s.rawId, ...s.recentlyProcessed].slice(0, 20);
-          s.action = 'idle'; save(s);
-        }
 
-        if (s.action === 'pending') continue;
+          if (s.action === 'pending') continue;
 
-        // ── Pick next item ─────────────────────────────────────────────────────
-        // FIX: was `x.id !== s.rawId` which only excluded the LAST processed item,
-        // causing the highest-dwell items A and B to oscillate forever (A->B->A->B).
-        // recentlyProcessed tracks the last 20 processed IDs; when the queue is
-        // exhausted (all items recently processed), reset and start the cycle again.
-        let pick = null, pickCPT = null, anyAvailable = false;
-        for (const cpt of CPTS) {
-          const items = await fetchItems(cpt, s.skipList, s.cooldowns);
-          if (items.length > 0) anyAvailable = true;
-          const c = items.find(x => !s.recentlyProcessed.includes(x.id));
-          if (c) { pick = c; pickCPT = cpt; break; }
-        }
-
-        if (!pick) {
-          // All available items were recently processed -- clear and retry next poll
-          if (anyAvailable) {
-            console.log('[RSR+][Rodeo] All items recently processed -- resetting cycle');
-            s.recentlyProcessed = [];
-            save(s);
+          // Pick highest-dwell item not recently processed
+          var pick = null, pickCPT = null, anyAvailable = false;
+          for (var ci = 0; ci < CPTS.length; ci++) {
+            var cpt   = CPTS[ci];
+            var items = await fetchItems(cpt, s.skipList, s.cooldowns);
+            if (items.length > 0) anyAvailable = true;
+            var c = items.find(function(x) { return !s.recentlyProcessed.includes(x.id); });
+            if (c) { pick = c; pickCPT = cpt; break; }
           }
-          continue;
+
+          if (!pick) {
+            if (anyAvailable) {
+              console.log('[RSR+][Rodeo] All items recently processed -- resetting cycle');
+              s.recentlyProcessed = [];
+              save(s);
+            }
+            continue;
+          }
+
+          // Resolve Trickle ID:
+          //   spP -> toTrickle() -- direct formula, confirmed working
+          //   spR -> ShipmentId from Rodeo data-url -> tantei GraphQL -> containerLabel
+          var trickleId;
+          if (pick.id.startsWith('spR')) {
+            var shipId = sp00ToShipmentId[pick.id];
+            if (!shipId) {
+              console.log('[RSR+][Rodeo] No ShipmentId for spR:', pick.id, '-- 30s retry');
+              s.cooldowns[pick.id] = Date.now() + 30000;
+              s.recentlyProcessed = [pick.id].concat(s.recentlyProcessed).slice(0, 20);
+              save(s); continue;
+            }
+            trickleId = await lookupTrickleIdFromTantei(shipId);
+            if (!trickleId) {
+              console.log('[RSR+][Rodeo] Tantei lookup failed for', pick.id, '(shipId:', shipId, ') -- 5m cooldown');
+              s.cooldowns[pick.id] = Date.now() + COOLDOWN_MS;
+              s.recentlyProcessed = [pick.id].concat(s.recentlyProcessed).slice(0, 20);
+              save(s); continue;
+            }
+          } else {
+            trickleId = toTrickle(pick.id);
+          }
+
+          s.sp00   = trickleId;      s.rawId  = pick.id;
+          s.destId = pickCPT.destId; s.cpt    = pickCPT.label;
+          s.action = 'pending'; save(s);
+          console.log('[RSR+][Rodeo] Assigned:', pick.id, '->', s.sp00, '| CPT:', s.cpt);
+
+        } catch (err) {
+          console.log('[RSR+][Rodeo] Loop error (recovering):', err.message || err);
+          await sleep(3000);
         }
-
-        const prevIdx = CPTS.findIndex(c => c.label === s.cpt);
-        const nextIdx = CPTS.findIndex(c => c.label === pickCPT.label);
-        if      (prevIdx > nextIdx && s.rawId)                     s.pausedAt = { cpt: s.cpt, rawId: s.rawId };
-        else if (s.pausedAt && pickCPT.label === s.pausedAt.cpt)   s.pausedAt = null;
-        else if (nextIdx >= prevIdx && prevIdx !== -1)              s.pausedAt = null;
-
-        s.sp00  = toTrickle(pick.id); s.rawId = pick.id;
-        s.destId = pickCPT.destId;    s.cpt   = pickCPT.label;
-        s.action = 'pending'; save(s);
-        console.log('[RSR+][Rodeo] Assigned:', pick.id, '->', s.sp00, '| CPT:', s.cpt);
       }
     }
     loop();
   }
 
-  // ============================================================================
+  // ==========================================================================
   //  TRICKLE
-  // ============================================================================
+  // ==========================================================================
   function runTrickle() {
+    console.log('[RSR+][Trickle] runTrickle() called');
 
-    // ── Flash bar ─────────────────────────────────────────────────────────────
-    const bar = document.createElement('div');
-    Object.assign(bar.style, {
-      position:'fixed', top:'0', left:'0', right:'0', padding:'5px 10px',
-      fontSize:'13px', fontWeight:'bold', fontFamily:'Courier New,monospace',
-      zIndex:'99999', textAlign:'center', display:'none',
-    });
-    document.body.appendChild(bar);
-
-    function flash(msg, bg, ms = 1200) {
-      bar.textContent = msg; bar.style.background = bg;
-      bar.style.color = '#fff'; bar.style.display = 'block';
-      clearTimeout(bar._t);
-      bar._t = setTimeout(() => { bar.style.display = 'none'; }, ms);
-    }
-
-    // ── Page state ────────────────────────────────────────────────────────────
-    function sdMsg() {
-      const el = document.getElementById('sd_message');
-      return el ? el.textContent.trim() : '';
-    }
+    function sdMsg()      { var el = document.getElementById('sd_message'); return el ? el.textContent.trim() : ''; }
     function atStart()    { return /scan container to move/i.test(sdMsg()); }
     function atDestStep() { return /scan destination/i.test(sdMsg()); }
 
-    // ── Scanner injection ─────────────────────────────────────────────────────
+    function infodisplayText() {
+      var el = document.getElementById('infodisplay');
+      return el ? el.textContent.trim() : '';
+    }
+
     function scanInject(value) {
-      const el = document.getElementById('sd_input');
+      var el = document.getElementById('sd_input');
       if (el) el.value = value;
-      const sd = unsafeWindow.sd;
+      var sd = null;
+      try { sd = (typeof unsafeWindow !== 'undefined') ? unsafeWindow.sd : null; } catch (e) {}
       if (sd && typeof sd.receivedScanEvent === 'function') {
         sd.receivedScanEvent(value, '', '');
         return true;
       }
       if (!el) return false;
       el.focus(); el.value = '';
-      for (const ch of value) {
-        const o = { key:ch, charCode:ch.charCodeAt(0), keyCode:ch.charCodeAt(0), bubbles:true };
+      for (var i = 0; i < value.length; i++) {
+        var ch = value[i];
+        var o = { key: ch, charCode: ch.charCodeAt(0), keyCode: ch.charCodeAt(0), bubbles: true };
         el.dispatchEvent(new KeyboardEvent('keydown',  o));
         el.dispatchEvent(new KeyboardEvent('keypress', o));
         el.value += ch;
         el.dispatchEvent(new KeyboardEvent('keyup', o));
       }
-      el.dispatchEvent(new KeyboardEvent('keydown', { key:'Enter', keyCode:13, bubbles:true }));
-      el.dispatchEvent(new KeyboardEvent('keyup',   { key:'Enter', keyCode:13, bubbles:true }));
+      el.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', keyCode: 13, bubbles: true }));
+      el.dispatchEvent(new KeyboardEvent('keyup',   { key: 'Enter', keyCode: 13, bubbles: true }));
       return true;
     }
 
-    function infodisplayText() {
-      const el = document.getElementById('infodisplay');
-      return el ? el.textContent.trim() : '';
-    }
-
-    // ── Dest scan with persistent observer ────────────────────────────────────
-    // FIX: old `!atDestStep()` false-positive -- after BEEP the page resets to
-    // "Scan container to move", which looks like success. New approach: attach a
-    // dedicated MutationObserver to #infodisplay BEFORE the scan so it records
-    // ALL text that appears (even if it clears in <50ms). Then decide on that history.
-    async function tryScanDestId(destId, sp00) {
-      console.log('[RSR+] Trying destId:', destId);
-      flash(`DEST: ${destId.slice(0,22)}...`, '#1a237e', 900);
-
-      // Start recording infodisplay text changes before injecting
-      const infoEl = document.getElementById('infodisplay');
-      const seen   = new Set();
-      const infoObs = new MutationObserver(() => {
-        const t = infoEl ? infoEl.textContent.trim() : '';
-        if (t) seen.add(t);
-      });
-      if (infoEl) infoObs.observe(infoEl, { childList: true, subtree: true, characterData: true });
-
-      console.log('[RSR+] sdMsg before destId scan:', sdMsg());
+    async function tryScanDestId(destId) {
+      console.log('[RSR+] Scanning destId:', destId);
       scanInject(destId);
-
-      // Wait for page to leave dest step, or 2.5s timeout
-      await waitFor(() => {
-        // Also capture current infodisplay text inside the waitFor predicate
-        const t = infodisplayText();
-        if (t) seen.add(t);
-        return !atDestStep();
-      }, 2500);
-
-      // Extra 150ms to catch any trailing text update
+      await waitFor(function() { return !atDestStep(); }, 2500);
       await sleep(150);
-      const trailing = infodisplayText();
-      if (trailing) seen.add(trailing);
-
-      infoObs.disconnect();
-
-      const allSeen = [...seen].join(' ');
-      console.log('[RSR+] infodisplay history:', allSeen || '(empty)');
-
-      // FIX v2.14.0: use SP00 presence in infodisplay as the POSITIVE success signal.
-      // On success, Trickle appends "Moved container `SP...` To `CART...`" to infodisplay.
-      // On stray-path BEEP, infodisplay is unchanged (shows previous item's text, not current sp00).
-      // allSeen.includes(sp00) is reliable -- the full SP00 ID won't appear in a previous item's text.
-      if (sp00 && allSeen.includes(sp00)) {
-        console.log('[RSR+] Move confirmed (infodisplay contains sp00):', sp00);
-        return 'success';
-      }
-      if (/already scanned|move_to_sameparent/i.test(allSeen)) {
-        console.log('[RSR+] Already in container -- success');
-        return 'success';
-      }
-      if (/not open|no active|waterspider/i.test(allSeen)) return 'closed';
-      if (/wrong barcode|scan correct|cannot move|does not have|not in the right|package not found|invalid/i.test(allSeen)) {
-        console.log('[RSR+] destId hard reject. Seen:', allSeen);
-        return 'reject';
-      }
-
-      // Page left dest step but SP00 not confirmed = stray BEEP rejection (silent fail)
-      if (!atDestStep()) {
-        console.log('[RSR+] BEEP -- SP00 not confirmed in infodisplay. Treating as reject.');
-        return 'reject';
-      }
-
-      console.log('[RSR+] destId timed out at dest step:', destId);
-      return 'reject';
+      if (atDestStep()) { console.log('[RSR+] destId timed out'); return 'reject'; }
+      var info = infodisplayText();
+      console.log('[RSR+] infodisplay after dest scan:', info || '(empty)');
+      if (/not open|no active|waterspider/i.test(info))                                                return 'closed';
+      if (/wrong barcode|scan correct|cannot move|does not have|package not found|invalid/i.test(info)) return 'reject';
+      console.log('[RSR+] Move accepted');
+      return 'success';
     }
 
-    // Only try the primary destId. No fallback to other CPT containers.
-    // After any BEEP, Trickle resets to start state -- scanning a destId at start state
-    // would make Trickle treat the UUID as a "container to move" (not a destination).
-    async function tryAllDestIds(primaryDestId, sp00) {
+    async function tryDestId(primaryDestId) {
       await sleep(200);
-      const result = await tryScanDestId(primaryDestId, sp00);
-
-      if (result === 'success') return primaryDestId;
-
+      var result = await tryScanDestId(primaryDestId);
+      if (result === 'success') return true;
       if (result === 'closed') {
-        flash('CONTAINER NOT OPEN -- waiting 45s', '#e65100', 45000);
-        console.log('[RSR+] Container not open. Waiting 45s...');
+        console.log('[RSR+] Container not open -- waiting 45s');
         await sleep(45000);
-        // Don't retry here -- page is now at start state and would need a full SP00 re-scan.
-        // Fail this attempt; Rodeo will put item on 5-min cooldown and retry the full flow.
       }
-
-      return null;
+      return false;
     }
 
-    // ── Submit ────────────────────────────────────────────────────────────────
     async function submit(s) {
-      // Always reset to start before step 1 (prevents stale dest-step state)
       if (!atStart()) {
-        const btn = document.getElementById('start_again');
+        var btn = document.getElementById('start_again');
         if (btn) btn.click();
-        const ok = await waitFor(atStart, 3000);
-        if (!ok) {
-          console.log('[RSR+] Cannot reach start state. sdMsg:', sdMsg());
-          return false;
-        }
+        var ok = await waitFor(atStart, 3000);
+        if (!ok) { console.log('[RSR+] Cannot reach start state. sdMsg:', sdMsg()); return false; }
       }
 
-      // Step 1: scan SP00
       console.log('[RSR+] Step 1: scanning SP00:', s.sp00);
-      flash(`SP00: ${s.sp00}`, '#37474f', 800);
       scanInject(s.sp00);
 
-      const resolved = await waitFor(
-        () => atDestStep() || /wrong barcode|scan correct sc|unrecognized/i.test(infodisplayText()),
+      var resolved = await waitFor(
+        function() { return atDestStep() || /wrong barcode|scan correct sc|unrecognized/i.test(infodisplayText()); },
         6000
       );
 
-      if (!resolved) {
-        console.log('[RSR+] Step 1 timeout. sdMsg:', sdMsg());
-        return 'step1_fail';
-      }
-      if (!atDestStep()) {
-        console.log('[RSR+] Step 1 rejected. infodisplay:', infodisplayText());
-        flash(`SKIP: ${s.sp00}`, '#b71c1c', 3000);
-        return 'step1_fail';
-      }
+      if (!resolved) { console.log('[RSR+] Step 1 timeout. sdMsg:', sdMsg()); return 'step1_fail'; }
+      if (!atDestStep()) { console.log('[RSR+] Step 1 rejected. infodisplay:', infodisplayText()); return 'step1_fail'; }
 
-      // FIX v2.13.0: wait 600ms for Trickle scanner to fully enter dest-step mode.
-      // sd.receivedScanEvent uses a stray-scan fallback when the scanner isn't ready.
-      // A destId arriving too early goes through that path, gets a silent BEEP,
-      // and infodisplay stays empty -- causing a false success. Stabilize first.
       await sleep(600);
-      if (!atDestStep()) {
-        console.log('[RSR+] Dest step not stable after SP00. sdMsg:', sdMsg());
-        return 'step1_fail';
-      }
+      if (!atDestStep()) { console.log('[RSR+] Dest step not stable.'); return 'step1_fail'; }
 
-      // Step 2: scan destIds
-      const worked = await tryAllDestIds(s.destId, s.sp00);
-      if (!worked) console.log('[RSR+] All destIds failed.');
-      return worked !== null;
+      var worked = await tryDestId(s.destId);
+      if (!worked) console.log('[RSR+] destId failed.');
+      return worked;
     }
 
-    // ── Process loop ─────────────────────────────────────────────────────────
     async function loop() {
+      console.log('[RSR+][Trickle] loop() called');
       await sleep(2000);
+      console.log('[RSR+][Trickle] Loop started');
 
+      var idleTicks = 0;
       while (true) {
-        await sleep(TRICKLE_MS);
-        const s = load();
-        if (s.action !== 'pending') continue;
+        try {
+          await sleep(TRICKLE_MS);
+          var s = load();
+          if (s.action !== 'pending') {
+            if (++idleTicks % 50 === 0)
+              console.log('[RSR+][Trickle] Idle. action:', s.action);
+            continue;
+          }
+          idleTicks = 0;
 
-        const result = await submit(s);
+          var result = await submit(s);
 
-        const s2 = load();
-        if (s2.sp00 !== s.sp00) continue; // Rodeo moved on
+          var s2 = load();
+          if (s2.sp00 !== s.sp00) continue;
 
-        if (result === 'step1_fail') {
-          s2.action = 'step1_fail';
-          save(s2);
-          await sleep(1000);
-        } else if (result === true) {
-          s2.action = 'done';
-          save(s2);
-          flash(`SUCCESS  ${s.sp00}`, '#1b5e20', 1500);
-        } else {
-          s2.action = 'error';
-          save(s2);
-          flash(`ALL DESTS FAILED  ${s.sp00}`, '#7f0000', 3000);
+          if (result === 'step1_fail') {
+            s2.action = 'step1_fail'; save(s2);
+            await sleep(1000);
+          } else if (result === true) {
+            s2.action = 'done'; save(s2);
+            console.log('[RSR+] SUCCESS:', s.sp00);
+          } else {
+            s2.action = 'error'; save(s2);
+            console.log('[RSR+] FAILED:', s.sp00);
+          }
+
+        } catch (err) {
+          console.log('[RSR+][Trickle] Loop error (recovering):', err.message || err);
+          await sleep(2000);
         }
       }
     }
