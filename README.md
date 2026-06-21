@@ -1,6 +1,6 @@
 # RSR+ Outbound Trickle v2
 
-**Author:** youryanh | **Version:** 2.18.1 | **Updated:** 2026-06-20
+**Author:** youryanh | **Version:** 2.18.2 | **Updated:** 2026-06-20
 
 Tampermonkey userscript that automates the Amazon Sort Center outbound trickle workflow.
 Reads SP00 containers from the Rodeo `ManifestPending` work pool, converts them to the
@@ -242,6 +242,34 @@ delete the `rsr_v2` key, then reload the Rodeo tab.
 ---
 
 ## Version History
+
+### v2.18.2 — 2026-06-21
+**Fix: background tab support — runs while you work in other tabs**
+
+Previously the script required the Trickle tab to stay focused. Switching to another
+tab caused keyboard scan injection to fail silently, and background timer throttling
+(Firefox clamps `setTimeout` to ~1s when hidden) caused lag on return.
+
+**`waitVisible()`** — new helper. Resolves immediately if the tab is visible; if hidden,
+waits silently until the tab is focused again before unblocking.
+
+**`sleepOrVisible(ms)`** — replaces `sleep(MOVE_MS)` in the processing loop. Behaves
+identically when the tab is visible. When the tab is hidden, resolves the moment you
+switch back instead of waiting out the throttled timer — so the next item is picked up
+immediately on return with no lag.
+
+**`scanInject` → async** — two paths:
+- `sd.receivedScanEvent` (primary): direct JS call, already works in background tabs
+  with no changes. This path handles the vast majority of scans.
+- Keyboard fallback: requires tab focus. Now checks `document.hidden` before dispatching
+  events. If hidden, calls `waitVisible()` and holds the scan until the tab regains focus,
+  then fires — no failures, no permission errors.
+
+**Practical result:** Open the Trickle tab, leave it in the background, and work freely
+in other tabs. Rodeo polling and scan injection continue uninterrupted. Return to the
+Trickle tab at any time — processing resumes immediately.
+
+---
 
 ### v2.18.1 — 2026-06-20
 **Modernize: var → let/const, arrow functions, single-pass filter, optional chaining**
