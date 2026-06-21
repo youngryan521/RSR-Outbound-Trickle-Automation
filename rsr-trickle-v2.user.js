@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RSR+ Outbound Trickle v2
 // @namespace    https://github.com/youngryan521
-// @version      2.18.1
+// @version      2.18.2
 // @description  Incremental SP00 relay -- Rodeo ManifestPending -> Sort Center Trickle, priority by CPT
 // @author       youryanh
 // @match        https://rodeo-iad.amazon.com/*
@@ -336,12 +336,34 @@
     const atDestStep = () => /scan destination/i.test(sdMsg());
     const infoText   = () => document.getElementById('infodisplay')?.textContent.trim() ?? '';
 
-    const scanInject = value => {
+    // Resolves immediately if the tab is visible; waits for focus if hidden
+    const waitVisible = () => new Promise(resolve => {
+      if (!document.hidden) { resolve(); return; }
+      const h = () => { if (!document.hidden) { document.removeEventListener('visibilitychange', h); resolve(); } };
+      document.addEventListener('visibilitychange', h);
+    });
+
+    // Like sleep(), but wakes early when the tab becomes visible (avoids background-throttle lag)
+    const sleepOrVisible = ms => new Promise(resolve => {
+      const t = setTimeout(resolve, ms);
+      if (!document.hidden) return;
+      const h = () => { if (!document.hidden) { clearTimeout(t); document.removeEventListener('visibilitychange', h); resolve(); } };
+      document.addEventListener('visibilitychange', h);
+    });
+
+    const scanInject = async value => {
       const el = document.getElementById('sd_input');
       if (el) el.value = value;
       let sd = null;
       try { sd = (typeof unsafeWindow !== 'undefined') ? unsafeWindow.sd : null; } catch {}
+      // Primary path: direct JS call -- works in background tabs without any special handling
       if (sd?.receivedScanEvent) { sd.receivedScanEvent(value, '', ''); return true; }
+      // Keyboard fallback requires tab focus -- pause here if the tab is currently hidden
+      if (document.hidden) {
+        console.log('[RSR+] Tab hidden -- waiting for visibility to inject scan');
+        await waitVisible();
+        await sleep(150); // brief settle after tab regains focus
+      }
       if (!el) return false;
       el.focus(); el.value = '';
       for (const ch of value) {
@@ -358,7 +380,7 @@
 
     const tryScanDestId = async destId => {
       console.log('[RSR+] Scanning destId:', destId);
-      scanInject(destId);
+      await scanInject(destId);
       await waitFor(() => !atDestStep(), 2500);
       await sleep(150);
       if (atDestStep()) { console.log('[RSR+] destId timed out'); return 'reject'; }
@@ -384,7 +406,7 @@
         if (!await waitFor(atStart, 3000)) { console.log('[RSR+] Cannot reach start. sdMsg:', sdMsg()); return false; }
       }
       console.log('[RSR+] Step 1:', s.sp00);
-      scanInject(s.sp00);
+      await scanInject(s.sp00);
       const resolved = await waitFor(
         () => atDestStep() || /wrong barcode|scan correct sc|unrecognized/i.test(infoText()),
         6000
@@ -404,7 +426,7 @@
       let idleTicks = 0;
       while (true) {
         try {
-          await sleep(MOVE_MS);
+          await sleepOrVisible(MOVE_MS);
           const s = load();
           if (s.action !== 'pending') {
             if (++idleTicks % 50 === 0) console.log('[RSR+][Trickle] Idle. action:', s.action);
