@@ -1,6 +1,6 @@
 # RSR+ Outbound Dropzone v2
 
-**Author:** youryanh | **Version:** 1.1.1 | **Updated:** 2026-06-20
+**Author:** youryanh | **Version:** 1.1.2 | **Updated:** 2026-06-20
 
 A Tampermonkey userscript that automates the **Sort Center Rodeo → Move (Dropzone)**
 workflow at Amazon FCs. Reads the ManifestPending queue from Rodeo, converts each SP00
@@ -218,6 +218,27 @@ at a time in Tampermonkey.
 ---
 
 ## Version History
+
+### v1.1.2 -- 2026-06-24
+**Feature: CPT counter banner (parity with Trickle v2.18.3)**
+
+A small pill-shaped counter bar is now fixed at the bottom-center of the Move tab,
+matching the one added to the Trickle script in v2.18.3.
+
+```
+ 14:30: 0  |  22:00: 0  |  02:00: 47
+```
+
+- Counts are read from `ok14` / `ok22` / `ok02` in GM storage on every loop tick
+- Banner appears immediately on page load with stored counts (persists across refreshes
+  within the same TM storage key -- resets only when the `rsr_dropzone_v2` key is cleared)
+- Color-coded: 14:30 = green, 22:00 = blue, 02:00 = orange
+- `pointerEvents: none` -- cannot be accidentally clicked or interfere with the page
+- Updates within one Rodeo poll cycle (~2s) of each successful move
+- Note: all CPTs share the same Dropzone destId, but counts are still tracked
+  per-CPT based on which CPT window the package belongs to
+
+---
 
 ### v1.1.1 — 2026-06-21
 **Fix: background tab support — runs while you work in other tabs**
