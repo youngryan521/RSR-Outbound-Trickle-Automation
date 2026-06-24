@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RSR+ Outbound Trickle v2
 // @namespace    https://github.com/youngryan521
-// @version      2.19.0
+// @version      2.20.0
 // @description  Incremental SP00 relay -- Rodeo ManifestPending -> Sort Center Trickle, priority by CPT
 // @author       youryanh
 // @match        https://rodeo-iad.amazon.com/*
@@ -238,6 +238,7 @@
     let cooldowns         = {};
     let errorCount        = {};
     let recentlyProcessed = [];
+    const alreadyMoved    = new Set(); // items confirmed already in cart -- counter skipped, never re-picked this session
 
     const addRecent = id => { recentlyProcessed = [id, ...recentlyProcessed].slice(0, 20); };
 
@@ -296,16 +297,23 @@
             }
             addRecent(s.rawId);
             s.action = 'idle'; save(s);
+
+          } else if (s.action === 'already_done') {
+            // Item confirmed already in cart -- do not increment counter
+            alreadyMoved.add(s.rawId);
+            addRecent(s.rawId);
+            s.action = 'idle'; save(s);
           }
 
           if (s.action === 'pending') continue;
 
-          // Pick highest-dwell item not recently processed
+          // Pick highest-dwell item not recently processed and not confirmed already moved
           let pick = null, pickCPT = null, anyAvailable = false;
           for (const cpt of CPTS) {
             const items = await fetchItems(cpt, s.skipList, cooldowns);
-            if (items.length) anyAvailable = true;
-            const c = items.find(x => !recentlyProcessed.includes(x.id));
+            const eligible = items.filter(x => !alreadyMoved.has(x.id));
+            if (eligible.length) anyAvailable = true;
+            const c = eligible.find(x => !recentlyProcessed.includes(x.id));
             if (c) { pick = c; pickCPT = cpt; break; }
           }
 
@@ -435,9 +443,11 @@
       await waitFor(() => !atDestStep(), 2500);
       await sleep(150);
       if (atDestStep()) { console.log('[RSR+] destId timed out'); return 'reject'; }
-      const info = infoText();
-      console.log('[RSR+] infodisplay:', info || '(empty)');
-      if (/not open|no active|waterspider/i.test(info))                                                return 'closed';
+      // 'already scanned' message appears in sdMsg area, not #infodisplay -- read both
+      const info = infoText() + ' ' + sdMsg();
+      console.log('[RSR+] infodisplay:', infoText() || '(empty)', '| sdMsg:', sdMsg() || '(empty)');
+      if (/already scanned to container/i.test(info))                                                  { console.log('[RSR+] Already in cart -- skipping counter'); return 'already_done'; }
+      if (/not open|no active|waterspider/i.test(info))                                                 return 'closed';
       if (/wrong barcode|scan correct|cannot move|does not have|package not found|invalid/i.test(info)) return 'reject';
       console.log('[RSR+] Move accepted');
       return 'success';
@@ -488,9 +498,10 @@
           const result = await submit(s);
           const s2 = load();
           if (s2.sp00 !== s.sp00) continue;
-          if      (result === 'step1_fail') { s2.action = 'step1_fail'; save(s2); await sleep(1000); }
-          else if (result === true)         { s2.action = 'done';       save(s2); console.log('[RSR+] SUCCESS:', s.sp00); }
-          else                              { s2.action = 'error';      save(s2); console.log('[RSR+] FAILED:',  s.sp00); }
+          if      (result === 'step1_fail')   { s2.action = 'step1_fail';   save(s2); await sleep(1000); }
+          else if (result === true)           { s2.action = 'done';         save(s2); console.log('[RSR+] SUCCESS:', s.sp00); }
+          else if (result === 'already_done') { s2.action = 'already_done'; save(s2); console.log('[RSR+] ALREADY DONE:', s.sp00); }
+          else                                { s2.action = 'error';        save(s2); console.log('[RSR+] FAILED:',  s.sp00); }
         } catch (err) {
           console.log('[RSR+][Trickle] Loop error:', err.message || err);
           await sleep(2000);

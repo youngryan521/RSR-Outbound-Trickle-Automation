@@ -1,6 +1,6 @@
 # RSR+ Outbound Trickle v2
 
-**Author:** youryanh | **Version:** 2.19.0 | **Updated:** 2026-06-24
+**Author:** youryanh | **Version:** 2.20.0 | **Updated:** 2026-06-24
 
 Tampermonkey userscript that automates the Amazon Sort Center outbound trickle workflow.
 Reads SP00 containers from the Rodeo `ManifestPending` work pool, converts them to the
@@ -243,6 +243,36 @@ storage — they live in module-scope memory and reset automatically on page rel
 ---
 
 ## Version History
+
+### v2.20.0 — 2026-06-24
+**Fix: "already scanned to Container" -- accurate counters + session block set**
+
+**Problem:** When Rodeo sync lag caused already-moved items to remain in ManifestPending,
+the script would re-scan them. Trickle responded with "Package already scanned to Container-
+Place package on container and scan next package." This message does not appear in `#infodisplay`
+— it appears in the `#sd_message` area. The script read only `#infodisplay`, found it empty,
+and incorrectly counted the re-scan as a new successful move.
+
+**Fix 1 — detection:** `tryScanDestId()` now reads `infoText() + ' ' + sdMsg()` instead of
+`infoText()` alone. The combined string is checked for `/already scanned to container/i`
+before any other pattern. Returns new result `'already_done'` when matched.
+
+**Fix 2 -- accurate counter:** The Rodeo handler for `'already_done'` does **not** increment
+`ok14` / `ok22` / `ok02`. The item was already counted when it was originally moved. Re-counting
+it inflated the banner numbers.
+
+**Fix 3 -- session block set:** `alreadyMoved = new Set()` added to `runRodeo()` as a
+module-scope variable. When `'already_done'` is received, the rawId is added to this set.
+The pick loop filters out all `alreadyMoved` items before selecting the next package.
+Once an item is confirmed already in cart, it is never picked again for the rest of the session.
+Rodeo naturally stops showing it in ManifestPending after sync clears — no timer or expiry needed.
+
+**Console output added:** Each path now logs distinctly:
+- Normal move: `[RSR+] Move accepted`
+- Already done: `[RSR+] Already in cart -- skipping counter`
+- Both paths log both `infodisplay` and `sdMsg` values for easier debugging
+
+---
 
 ### v2.19.0 — 2026-06-24
 **Optimization: module-scope ephemeral state + shift-start skipList reset + FIFO cap**
