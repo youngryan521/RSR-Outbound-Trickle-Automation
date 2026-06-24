@@ -1,6 +1,6 @@
 # RSR+ Outbound Trickle v2
 
-**Author:** youryanh | **Version:** 2.18.3 | **Updated:** 2026-06-20
+**Author:** youryanh | **Version:** 2.19.0 | **Updated:** 2026-06-24
 
 Tampermonkey userscript that automates the Amazon Sort Center outbound trickle workflow.
 Reads SP00 containers from the Rodeo `ManifestPending` work pool, converts them to the
@@ -90,9 +90,9 @@ the same items from cycling. When all available items have been recently process
 the list resets and the full queue is eligible again.
 
 Filters applied before picking:
-1. `skipList` — permanently excluded (step-1 rejections or 3-strike items)
-2. `cooldowns` — temporarily excluded until 5-min timer expires (container-closed errors)
-3. `recentlyProcessed` — excluded for the current processing cycle (prevents oscillation)
+1. `skipList` — permanently excluded (step-1 rejections or 3-strike items); persisted in GM storage, FIFO-capped at 100 entries, cleared at shift start
+2. `cooldowns` — temporarily excluded until 5-min timer expires; lives in module-scope memory only, resets on page reload
+3. `recentlyProcessed` — excluded for the current processing cycle (prevents oscillation); lives in module-scope memory only, resets on page reload
 
 ---
 
@@ -226,22 +226,57 @@ Stored in Tampermonkey storage under key `rsr_v2` (JSON):
   "cpt":    "14:30",
   "action": "idle | pending | done | error | step1_fail",
   "pausedAt": null,
-  "skipList":  ["spRRF64dZr9"],
-  "cooldowns": { "spPxxxxxxx": 1750000000000 },
-  "recentlyProcessed": ["spPaaa", "spPbbb"],
-  "errorCount": { "spPxxx": 2 },
+  "skipList":     ["spRRF64dZr9"],
+  "lastActiveMs": 1750000000000,
   "ok14": 3, "err14": 0,
   "ok22": 0, "err22": 1,
   "ok02": 0, "err02": 0
 }
 ```
 
-To reset (clear skip list, cooldowns, counters): open Tampermonkey storage editor,
+To reset (clear skip list, counters): open Tampermonkey storage editor,
 delete the `rsr_v2` key, then reload the Rodeo tab.
+
+Note: `cooldowns`, `errorCount`, and `recentlyProcessed` are no longer persisted in GM
+storage — they live in module-scope memory and reset automatically on page reload.
 
 ---
 
 ## Version History
+
+### v2.19.0 — 2026-06-24
+**Optimization: module-scope ephemeral state + shift-start skipList reset + FIFO cap**
+
+**Root cause addressed:** `cooldowns`, `errorCount`, and `recentlyProcessed` were previously
+written to GM storage on every loop tick. Over a busy shift (700–1800 packages) these objects
+could accumulate ~80–100KB of data, all of which was parsed and re-serialized at 600ms intervals.
+Stale entries from prior shifts were never pruned.
+
+**Fix — module-scope variables (Rodeo side):**
+`cooldowns`, `errorCount`, and `recentlyProcessed` now live as plain JavaScript variables
+inside `runRodeo()`. They reset naturally on every page reload. GM storage is never written
+for these fields, so they cannot accumulate across shifts.
+
+**Fix — shift-start skipList reset:**
+On page load, the script checks `Date.now() - lastActiveMs`. If the gap exceeds 8 hours
+(new shift), the `skipList` is automatically cleared. Stale skip entries from the prior
+shift do not carry over.
+
+**Fix — skipList FIFO cap:**
+`skipList` is now capped at 100 entries. When a new entry would exceed the cap, the oldest
+entry is dropped (first-in, first-out). Prevents unbounded growth even within a single shift.
+
+**New field:** `lastActiveMs` — timestamp of the most recent `save()` call. Stamped on every
+GM write. Drives the 8-hour shift-start detection.
+
+**Storage impact:**
+- Before: up to ~80–100KB per busy shift, growing across sessions
+- After: ~3KB permanently, regardless of shift volume or session count
+
+**Removed from GM storage:** `cooldowns`, `errorCount`, `recentlyProcessed`
+**Added to GM storage:** `lastActiveMs`
+
+---
 
 ### v2.18.3 -- 2026-06-24
 **Feature: CPT counter banner**
