@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RSR+ Outbound Trickle v2
 // @namespace    https://github.com/youngryan521
-// @version      2.18.2
+// @version      2.18.3
 // @description  Incremental SP00 relay -- Rodeo ManifestPending -> Sort Center Trickle, priority by CPT
 // @author       youryanh
 // @match        https://rodeo-iad.amazon.com/*
@@ -336,6 +336,30 @@
     const atDestStep = () => /scan destination/i.test(sdMsg());
     const infoText   = () => document.getElementById('infodisplay')?.textContent.trim() ?? '';
 
+    // -- COUNTER BANNER -------------------------------------------------------
+    const banner = document.createElement('div');
+    Object.assign(banner.style, {
+      position: 'fixed', bottom: '12px', left: '50%', transform: 'translateX(-50%)',
+      background: '#1a1a2e', padding: '7px 22px', borderRadius: '20px',
+      fontSize: '13px', fontFamily: 'Courier New, monospace', fontWeight: 'bold',
+      zIndex: '99997', display: 'flex', gap: '22px', alignItems: 'center',
+      boxShadow: '0 2px 10px rgba(0,0,0,0.55)', border: '1px solid #333',
+      whiteSpace: 'nowrap', pointerEvents: 'none',
+    });
+    document.body.appendChild(banner);
+
+    const CPT_COLORS = { '14:30': '#4caf50', '22:00': '#42a5f5', '02:00': '#ffa726' };
+
+    const updateBanner = s => {
+      const counts = { '14:30': s.ok14 || 0, '22:00': s.ok22 || 0, '02:00': s.ok02 || 0 };
+      banner.innerHTML = Object.entries(counts).map(([label, n], i) =>
+        (i ? '<span style="color:#444;margin:0 2px">|</span>' : '') +
+        `<span style="color:#888">${label}:</span>&nbsp;` +
+        `<span style="color:${CPT_COLORS[label]};font-size:15px">${n}</span>`
+      ).join('');
+    };
+    updateBanner(load()); // show counts immediately on page load
+
     // Resolves immediately if the tab is visible; waits for focus if hidden
     const waitVisible = () => new Promise(resolve => {
       if (!document.hidden) { resolve(); return; }
@@ -428,6 +452,7 @@
         try {
           await sleepOrVisible(MOVE_MS);
           const s = load();
+          updateBanner(s);
           if (s.action !== 'pending') {
             if (++idleTicks % 50 === 0) console.log('[RSR+][Trickle] Idle. action:', s.action);
             continue;
