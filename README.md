@@ -1,6 +1,6 @@
 # RSR+ Outbound Dropzone v2
 
-**Author:** youryanh | **Version:** 1.1.2 | **Updated:** 2026-06-20
+**Author:** youryanh | **Version:** 1.2.0 | **Updated:** 2026-06-24
 
 A Tampermonkey userscript that automates the **Sort Center Rodeo → Move (Dropzone)**
 workflow at Amazon FCs. Reads the ManifestPending queue from Rodeo, converts each SP00
@@ -218,6 +218,39 @@ at a time in Tampermonkey.
 ---
 
 ## Version History
+
+### v1.2.0 — 2026-06-24
+**Optimization: module-scope ephemeral state + shift-start skipList reset + FIFO cap (parity with Trickle v2.19.0)**
+
+**Root cause addressed:** `cooldowns`, `errorCount`, and `recentlyProcessed` were previously
+written to GM storage on every loop tick. Over a busy shift (700–1800 packages) these objects
+could accumulate ~80–100KB of data. Stale entries from prior shifts were never pruned.
+
+**Fix — module-scope variables (Rodeo side):**
+`cooldowns`, `errorCount`, and `recentlyProcessed` now live as plain JavaScript variables
+inside `runRodeo()`. They reset naturally on every page reload. GM storage is never written
+for these fields, so they cannot accumulate across shifts.
+
+**Fix — shift-start skipList reset:**
+On page load, the script checks `Date.now() - lastActiveMs`. If the gap exceeds 8 hours
+(new shift), the `skipList` is automatically cleared. Stale skip entries from the prior
+shift do not carry over.
+
+**Fix — skipList FIFO cap:**
+`skipList` is now capped at 100 entries. When a new entry would exceed the cap, the oldest
+entry is dropped (first-in, first-out). Prevents unbounded growth even within a single shift.
+
+**New field:** `lastActiveMs` — timestamp of the most recent `save()` call. Stamped on every
+GM write. Drives the 8-hour shift-start detection.
+
+**Storage impact:**
+- Before: up to ~80–100KB per busy shift, growing across sessions
+- After: ~3KB permanently, regardless of shift volume or session count
+
+**Removed from GM storage:** `cooldowns`, `errorCount`, `recentlyProcessed`
+**Added to GM storage:** `lastActiveMs`
+
+---
 
 ### v1.1.2 -- 2026-06-24
 **Feature: CPT counter banner (parity with Trickle v2.18.3)**
