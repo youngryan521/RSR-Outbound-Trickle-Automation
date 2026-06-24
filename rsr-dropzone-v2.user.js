@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         RSR+ Outbound Dropzone v2
 // @namespace    https://github.com/youngryan521
-// @version      1.1.2
+// @version      1.2.0
 // @description  Incremental SP00 relay -- Rodeo ManifestPending -> Sort Center Move (Dropzone), priority by CPT
 // @author       youryanh
 // @match        https://rodeo-iad.amazon.com/*
@@ -22,8 +22,10 @@
   const KEY             = 'rsr_dropzone_v2';
   const RODEO_MS        = 2000;
   const MOVE_MS         = 600;
-  const FC_UTC_OFFSET_H = -5;        // QIW9 = CDT (UTC-5)
-  const COOLDOWN_MS     = 5 * 60000; // 5 min
+  const FC_UTC_OFFSET_H = -5;          // QIW9 = CDT (UTC-5)
+  const COOLDOWN_MS     = 5 * 60000;   // 5 min per-item retry delay
+  const SHIFT_GAP_MS    = 8 * 3600000; // 8h idle = new shift, clears skipList
+  const SKIP_CAP        = 100;          // max skipList entries (FIFO)
 
   const CPTS = [
     { label: '14:30', h: 14, m: 30, destId: '4ccd5e2a-9e00-3f03-1880-768b589f8210' },
@@ -32,19 +34,21 @@
   ];
 
   // -- STATE ------------------------------------------------------------------
+  // Only cross-tab coordination fields and persistent counters live in GM storage.
+  // Ephemeral session data (cooldowns, errorCount, recentlyProcessed) live in
+  // module-scope variables -- they reset naturally on page reload, never accumulate.
 
   const blank = () => ({
     sp00: null, rawId: null, destId: null, cpt: null, action: 'idle',
     pausedAt: null,
-    skipList:          [],
-    cooldowns:         {},
-    recentlyProcessed: [],
-    errorCount:        {},
+    skipList:     [],   // persisted -- hard-fail items; FIFO-capped at SKIP_CAP
+    lastActiveMs: 0,    // persisted -- drives shift-start detection
     ok14: 0, err14: 0, ok22: 0, err22: 0, ok02: 0, err02: 0,
   });
 
   const load = () => { try { return JSON.parse(GM_getValue(KEY, 'null')) || blank(); } catch { return blank(); } };
-  const save = s  => GM_setValue(KEY, JSON.stringify(s));
+  // Stamp lastActiveMs on every save so shift-start detection always has a fresh anchor
+  const save = s => { s.lastActiveMs = Date.now(); GM_setValue(KEY, JSON.stringify(s)); };
 
   // -- SP00 / CPT UTILS -------------------------------------------------------
 
@@ -229,7 +233,34 @@
     const okKey  = { '14:30': 'ok14',  '22:00': 'ok22',  '02:00': 'ok02'  };
     const errKey = { '14:30': 'err14', '22:00': 'err22', '02:00': 'err02' };
 
-    const addRecent = (s, id) => { s.recentlyProcessed = [id, ...s.recentlyProcessed].slice(0, 20); };
+    // Ephemeral session state -- lives in memory only, resets naturally on page reload.
+    // Never written to GM storage, so they cannot accumulate across shifts.
+    let cooldowns         = {};
+    let errorCount        = {};
+    let recentlyProcessed = [];
+
+    const addRecent = id => { recentlyProcessed = [id, ...recentlyProcessed].slice(0, 20); };
+
+    // Push to skipList with FIFO cap -- drops oldest entry when cap exceeded
+    const addToSkipList = (s, id, reason) => {
+      if (!id || s.skipList.includes(id)) return;
+      s.skipList.push(id);
+      if (s.skipList.length > SKIP_CAP) s.skipList = s.skipList.slice(-SKIP_CAP);
+      console.log('[DZ+][Rodeo] Permanent skip (' + reason + '):', id);
+    };
+
+    // Shift-start check: runs once on page load.
+    // If Rodeo has been idle for 8+ hours, wipe stale skipList entries from last shift.
+    (function shiftStartCheck() {
+      const s0 = load();
+      const elapsed = Date.now() - (s0.lastActiveMs || 0);
+      if (elapsed > SHIFT_GAP_MS) {
+        const prev = (s0.skipList || []).length;
+        console.log('[DZ+][Rodeo] New shift detected (' + Math.round(elapsed / 3600000) + 'h idle) -- clearing skipList (' + prev + ' entries)');
+        s0.skipList = [];
+      }
+      save(s0); // stamps lastActiveMs for this session
+    })();
 
     async function loop() {
       console.log('[DZ+][Rodeo] Loop started | skipList:', load().skipList.length, '| action:', load().action);
@@ -237,40 +268,33 @@
         try {
           await sleep(RODEO_MS);
           const s = load();
-          s.skipList          = s.skipList          || [];
-          s.cooldowns         = s.cooldowns         || {};
-          s.recentlyProcessed = s.recentlyProcessed || [];
-          s.errorCount        = s.errorCount        || {};
+          s.skipList = s.skipList || [];
 
           // Handle outcome reported by the Move side
           if (s.action === 'done') {
             s[okKey[s.cpt]]++;
-            addRecent(s, s.rawId);
-            s.errorCount[s.rawId] = 0;
+            addRecent(s.rawId);
+            errorCount[s.rawId] = 0; // reset in-memory strike count on success
             s.action = 'idle'; save(s);
 
           } else if (s.action === 'step1_fail') {
             s[errKey[s.cpt]]++;
-            if (s.rawId && !s.skipList.includes(s.rawId)) {
-              s.skipList.push(s.rawId);
-              console.log('[DZ+][Rodeo] Permanent skip (step1):', s.rawId);
-            }
-            addRecent(s, s.rawId);
+            addToSkipList(s, s.rawId, 'step1');
+            addRecent(s.rawId);
             s.action = 'idle'; save(s);
 
           } else if (s.action === 'error') {
             s[errKey[s.cpt]]++;
             if (s.rawId) {
-              s.errorCount[s.rawId] = (s.errorCount[s.rawId] || 0) + 1;
-              if (s.errorCount[s.rawId] >= 3 && !s.skipList.includes(s.rawId)) {
-                s.skipList.push(s.rawId);
-                console.log('[DZ+][Rodeo] Permanent skip (3 errors):', s.rawId);
+              errorCount[s.rawId] = (errorCount[s.rawId] || 0) + 1;
+              if (errorCount[s.rawId] >= 3) {
+                addToSkipList(s, s.rawId, '3 errors');
               } else {
-                s.cooldowns[s.rawId] = Date.now() + COOLDOWN_MS;
-                console.log('[DZ+][Rodeo] Cooldown:', s.rawId, '(error #' + s.errorCount[s.rawId] + ')');
+                cooldowns[s.rawId] = Date.now() + COOLDOWN_MS;
+                console.log('[DZ+][Rodeo] Cooldown:', s.rawId, '(error #' + errorCount[s.rawId] + ')');
               }
             }
-            addRecent(s, s.rawId);
+            addRecent(s.rawId);
             s.action = 'idle'; save(s);
           }
 
@@ -279,14 +303,17 @@
           // Pick highest-dwell item not recently processed
           let pick = null, pickCPT = null, anyAvailable = false;
           for (const cpt of CPTS) {
-            const items = await fetchItems(cpt, s.skipList, s.cooldowns);
+            const items = await fetchItems(cpt, s.skipList, cooldowns);
             if (items.length) anyAvailable = true;
-            const c = items.find(x => !s.recentlyProcessed.includes(x.id));
+            const c = items.find(x => !recentlyProcessed.includes(x.id));
             if (c) { pick = c; pickCPT = cpt; break; }
           }
 
           if (!pick) {
-            if (anyAvailable) { s.recentlyProcessed = []; save(s); console.log('[DZ+][Rodeo] All recently processed -- resetting'); }
+            if (anyAvailable) {
+              recentlyProcessed = []; // module-scope reset -- no GM write needed
+              console.log('[DZ+][Rodeo] All recently processed -- resetting');
+            }
             continue;
           }
 
@@ -298,14 +325,14 @@
             const shipId = sp00ToShipmentId[pick.id];
             if (!shipId) {
               console.log('[DZ+][Rodeo] No ShipmentId for spR:', pick.id, '-- 30s retry');
-              s.cooldowns[pick.id] = Date.now() + 30000;
-              addRecent(s, pick.id); save(s); continue;
+              cooldowns[pick.id] = Date.now() + 30000; // module-scope, no GM write
+              addRecent(pick.id); continue;
             }
             trickleId = await lookupTrickleIdFromTantei(shipId);
             if (!trickleId) {
               console.log('[DZ+][Rodeo] Tantei failed for', pick.id, '-- 5m cooldown');
-              s.cooldowns[pick.id] = Date.now() + COOLDOWN_MS;
-              addRecent(s, pick.id); save(s); continue;
+              cooldowns[pick.id] = Date.now() + COOLDOWN_MS; // module-scope, no GM write
+              addRecent(pick.id); continue;
             }
           } else {
             trickleId = toTrickle(pick.id);
