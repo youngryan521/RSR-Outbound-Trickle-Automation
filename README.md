@@ -1,6 +1,6 @@
 # RSR+ Outbound Dropzone v2
 
-**Author:** youryanh | **Version:** 1.2.0 | **Updated:** 2026-06-24
+**Author:** youryanh | **Version:** 1.3.0 | **Updated:** 2026-06-24
 
 A Tampermonkey userscript that automates the **Sort Center Rodeo → Move (Dropzone)**
 workflow at Amazon FCs. Reads the ManifestPending queue from Rodeo, converts each SP00
@@ -218,6 +218,25 @@ at a time in Tampermonkey.
 ---
 
 ## Version History
+
+### v1.3.0 — 2026-06-24
+**Fix: "already scanned to Container" -- accurate counters + session block set (parity with Trickle v2.20.0)**
+
+**Problem:** Re-scanned already-moved items returned "Package already scanned to Container-
+Place package on container and scan next package." This message appears in the `#sd_message`
+area, not `#infodisplay`. The script found `#infodisplay` empty and incorrectly counted
+the re-scan as a new successful move, inflating the counter.
+
+**Fix 1 -- detection:** `tryScanDestId()` now reads `infoText() + ' ' + sdMsg()`.
+Returns `'already_done'` when `/already scanned to container/i` is matched.
+
+**Fix 2 -- accurate counter:** `'already_done'` handler in Rodeo does **not** increment
+`ok14` / `ok22` / `ok02`. Item was already counted on its original move.
+
+**Fix 3 -- session block set:** `alreadyMoved = new Set()` in `runRodeo()`. Once an item
+returns `'already_done'`, its rawId is added and it is never picked again this session.
+
+---
 
 ### v1.2.0 — 2026-06-24
 **Optimization: module-scope ephemeral state + shift-start skipList reset + FIFO cap (parity with Trickle v2.19.0)**
